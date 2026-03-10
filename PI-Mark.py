@@ -1,84 +1,133 @@
 import time
 import sys
-import threading
-import select
+import multiprocessing
+import os
 from decimal import Decimal, getcontext
 
-# Set a time limit (in seconds)
-TIME_LIMIT = 60  # Adjust as needed
-
-try:
-    import msvcrt  # Windows
-    def is_key_pressed():
-        return msvcrt.kbhit()
+def calculate_pi_worker(stop_event, queue, is_primary, core_id, ops_array):
+    """Worker process that calculates high-precision Pi and updates its own operation speed."""
+    getcontext().prec = 100000  
+    getcontext().Emax = 999999
     
-    def get_key():
-        return msvcrt.getch().decode('utf-8')
-except ImportError:
-    import termios
-    import tty
-    def get_key():
-        old_settings = termios.tcgetattr(sys.stdin)
-        try:
-            tty.setraw(sys.stdin.fileno())
-            key = sys.stdin.read(1)
-        finally:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-        return key
-
-def listen_for_exit():
-    global stop_flag
-    while True:
-        key = get_key()
-        if key.lower() == 'x':
-            stop_flag = True
-            break
-
-def calculate_pi():
-    global stop_flag
-    stop_flag = False
-    listener_thread = threading.Thread(target=listen_for_exit, daemon=True)
-    listener_thread.start()
+    # Initialize Chudnovsky algorithm variables using pure INTEGERS
+    K = 6
+    M = 1
+    L = 13591409
+    X = 1
+    S = Decimal(13591409)
+    k = 1
     
-    digits = 1
-    getcontext().prec = 10000  # Increase precision limit
-    getcontext().Emax = 999999  # Increase exponent max limit
-    C = 426880 * Decimal(10005).sqrt()
-    K = Decimal(6 * (0) + 1)
-    M = Decimal(1)
-    X = -262537412640768000.0  # Use float to prevent overflow
-    L = Decimal(13591409)
-    S = L
-    
-    start_time = time.time()
     operations = 0
+    start_time = time.time()
     
-    print("Starting Pi Calculation Benchmark... Press 'x' to stop.")
-    while not stop_flag:
-        K += 12
-        M *= Decimal(K ** 3) / Decimal((digits + 1) ** 3)  # Ensure M remains Decimal
-        X *= -262537412640768000.0  # Keep X as float to avoid Decimal overflow
+    while not stop_event.is_set():
+        M = (K**3 - 16*K) * M // (k**3)
         L += 545140134
-        S += (M * L) / Decimal(X)
-        operations += 6  # Estimated floating-point operations per iteration
+        X *= -262537412640768000
+        S += Decimal(M * L) / Decimal(X)
         
-        elapsed_time = time.time() - start_time
-        if elapsed_time >= TIME_LIMIT:
-            stop_flag = True
-            break
+        K += 12
+        k += 1
+        operations += 15 # Estimated math operations per iteration
         
-        flops = operations / elapsed_time if elapsed_time > 0 else 0
-        
-        # Update output dynamically
-        sys.stdout.write(f"\rDigits Calculated: {digits} | FLOPS: {flops:.2f} | Time Elapsed: {elapsed_time:.2f}s")
-        sys.stdout.flush()
-        
-        digits += 1
+        # Every core updates its own speed in the shared array
+        if k % 5 == 0:
+            elapsed = time.time() - start_time
+            ops_per_sec = operations / elapsed if elapsed > 0 else 0
+            ops_array[core_id] = ops_per_sec
+            
+            # Only the primary core handles the queue for the UI digits/time
+            if is_primary:
+                digits = k * 14
+                queue.put((digits, elapsed))
+            
+    if is_primary:
+        # Final calculation step
+        C = 426880 * Decimal(10005).sqrt()
+        pi = C / S
+        queue.put(str(pi)[:(k*14)])
+
+def main():
+    print("--- Pi-Mark CPU Stress Test & Calculator ---")
     
-    # pi = C / S  # Uncomment to show full pi number
-    print("\nBenchmark Complete!")
-    print(f"Total Time Elapsed: {elapsed_time:.2f} seconds")
-    # print(f"Calculated Pi: {str(pi)[:digits]}")  # Uncomment to show full pi number
+    try:
+        duration = float(input("Enter duration to run the stress test (in seconds): "))
+    except ValueError:
+        print("Invalid input. Defaulting to 60 seconds.")
+        duration = 60.0
+        
+    save_output = input("Output the final calculated Pi to a .txt file? (y/n): ").strip().lower() == 'y'
+    
+    cores = os.cpu_count() or 1
+    print(f"\nStarting benchmark on {cores} CPU cores to maximize resource usage...")
+    
+    stop_event = multiprocessing.Event()
+    queue = multiprocessing.Queue()
+    
+    # Create a shared memory array of 'doubles' (floats) sized to the number of cores
+    # This allows all worker processes to report their speed simultaneously
+    ops_array = multiprocessing.Array('d', cores)
+    processes = []
+    
+    for i in range(cores):
+        is_primary = (i == 0)
+        p = multiprocessing.Process(target=calculate_pi_worker, args=(stop_event, queue, is_primary, i, ops_array))
+        p.start()
+        processes.append(p)
+        
+    start_time = time.time()
+    last_digits = 0
+    
+    try:
+        while time.time() - start_time < duration:
+            # Drain queue to keep digits updated
+            while not queue.empty():
+                item = queue.get()
+                if isinstance(item, tuple):
+                    last_digits, _ = item
+            
+            # Sum the operations per second from ALL cores
+            total_ops_per_sec = sum(ops_array)
+            
+            # Note: We now label it "Total Ops/sec" because we switched to ultra-accurate Integer math 
+            # rather than floating point math in the previous step.
+            sys.stdout.write(f"\rDigits Calculated: ~{last_digits} | Total Ops/sec ({cores} Cores): {total_ops_per_sec:.2f} | Time Elapsed: {(time.time() - start_time):.2f}s ")
+            sys.stdout.flush()
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("\nEarly exit requested by user.")
+        
+    stop_event.set()
+    
+    total_ops_per_sec = sum(ops_array)
+    sys.stdout.write(f"\rDigits Calculated: ~{last_digits} | Total Ops/sec ({cores} Cores): {total_ops_per_sec:.2f} | Time Elapsed: {(time.time() - start_time):.2f}s \n")
+    print("\nBenchmark Complete! Finalizing Pi calculation (this may take a moment)...")
+    
+    final_pi = None
+    while True:
+        try:
+            item = queue.get(timeout=3)
+            if isinstance(item, str):
+                final_pi = item
+                break
+        except Exception:
+            break
+            
+    for p in processes:
+        p.join()
+        
+    if final_pi:
+        if save_output:
+            filename = "pi_output.txt"
+            with open(filename, "w") as f:
+                f.write(final_pi)
+            print(f"\nSuccess! Calculated Pi has been saved to '{filename}'.")
+            print(f"Total precise digits calculated: {len(final_pi) - 2}")
+        else:
+            print("\nPi calculation finished successfully (output not saved to file).")
+    else:
+        print("\nFailed to retrieve final Pi calculation.")
 
 if __name__ == "__main__":
-    calculate_pi()
+    multiprocessing.freeze_support()
+    main()
