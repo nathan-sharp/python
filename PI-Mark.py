@@ -3,6 +3,7 @@ import sys
 import multiprocessing
 import threading
 import os
+import queue
 from decimal import Decimal, getcontext
 
 # --- Cross-Platform Keyboard Listener ---
@@ -48,6 +49,7 @@ def calculate_pi_worker(stop_event, final_queue, is_primary, core_id, ops_array,
     
     operations = 0
     start_time = time.time()
+    last_snapshot_time = start_time
     
     while not stop_event.is_set():
         M = (K**3 - 16*K) * M // (k**3)
@@ -65,11 +67,17 @@ def calculate_pi_worker(stop_event, final_queue, is_primary, core_id, ops_array,
             
             if is_primary:
                 shared_digits.value = k * 14
+                # Send a periodic snapshot so the main process can autosave safely.
+                if elapsed - (last_snapshot_time - start_time) >= 10:
+                    C = 426880 * Decimal(10005).sqrt()
+                    pi_snapshot = C / S
+                    final_queue.put(("snapshot", str(pi_snapshot)[:(k*14)]))
+                    last_snapshot_time = time.time()
             
     if is_primary:
         C = 426880 * Decimal(10005).sqrt()
         pi = C / S
-        final_queue.put(str(pi)[:(k*14)])
+        final_queue.put(("final", str(pi)[:(k*14)]))
 
 def main():
     print("--- Pi-Mark CPU Stress Test & Calculator (Optimized) ---")
@@ -115,6 +123,11 @@ def main():
         processes.append(p)
         
     start_time = time.time()
+    final_pi = None
+    latest_pi_snapshot = None
+    autosave_filename = "pi_output.txt"
+    next_autosave_time = 10.0
+    autosave_file_created = False
     
     try:
         while time.time() - start_time < duration:
@@ -125,8 +138,39 @@ def main():
                 
             current_digits = shared_digits.value
             total_ops_per_sec = sum(ops_array)
+            elapsed = time.time() - start_time
+
+            # Drain any pending snapshots/final value from the worker queue.
+            while True:
+                try:
+                    item = final_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+                if isinstance(item, tuple) and len(item) == 2:
+                    msg_type, payload = item
+                    if msg_type in ("snapshot", "final"):
+                        latest_pi_snapshot = payload
+                        if msg_type == "final":
+                            final_pi = payload
+                elif isinstance(item, str):
+                    # Backward compatibility for older message format.
+                    latest_pi_snapshot = item
+                    final_pi = item
+
+            if save_output and elapsed >= next_autosave_time:
+                if not autosave_file_created:
+                    with open(autosave_filename, "w") as f:
+                        f.write(latest_pi_snapshot or "")
+                    autosave_file_created = True
+                    print(f"\nAutosave started: '{autosave_filename}' created at {elapsed:.1f}s.")
+                elif latest_pi_snapshot:
+                    with open(autosave_filename, "w") as f:
+                        f.write(latest_pi_snapshot)
+                    print(f"\nAutosave updated at {elapsed:.1f}s.")
+                next_autosave_time += 10.0
             
-            sys.stdout.write(f"\rDigits Calculated: ~{current_digits} | Total Ops/sec ({cores} Cores): {total_ops_per_sec:.2f} | Time Elapsed: {(time.time() - start_time):.2f}s ")
+            sys.stdout.write(f"\rDigits Calculated: ~{current_digits} | Total Ops/sec ({cores} Cores): {total_ops_per_sec:.2f} | Time Elapsed: {elapsed:.2f}s ")
             sys.stdout.flush()
             time.sleep(0.1)
             
@@ -141,12 +185,19 @@ def main():
     sys.stdout.write(f"\rDigits Calculated: ~{shared_digits.value} | Total Ops/sec ({cores} Cores): {total_ops_per_sec:.2f} | Time Elapsed: {(time.time() - start_time):.2f}s \n")
     print("\nBenchmark Complete! Finalizing Pi calculation (this may take a moment)...")
     
-    final_pi = None
     while True:
         try:
             item = final_queue.get(timeout=3)
-            if isinstance(item, str):
+            if isinstance(item, tuple) and len(item) == 2:
+                msg_type, payload = item
+                if msg_type in ("snapshot", "final"):
+                    latest_pi_snapshot = payload
+                    if msg_type == "final":
+                        final_pi = payload
+                        break
+            elif isinstance(item, str):
                 final_pi = item
+                latest_pi_snapshot = item
                 break
         except Exception:
             break
@@ -156,10 +207,9 @@ def main():
         
     if final_pi:
         if save_output:
-            filename = "pi_output.txt"
-            with open(filename, "w") as f:
+            with open(autosave_filename, "w") as f:
                 f.write(final_pi)
-            print(f"\nSuccess! Calculated Pi has been saved to '{filename}'.")
+            print(f"\nSuccess! Calculated Pi has been saved to '{autosave_filename}'.")
             print(f"Total precise digits calculated: {len(final_pi) - 2}")
         else:
             print("\nPi calculation finished successfully (output not saved to file).")
